@@ -1,0 +1,581 @@
+main.py
+
+from fastapi import FastAPI
+from sqlalchemy import create_engine
+import pandas as pd
+
+app = FastAPI()
+
+DB_USER = "postgres"
+DB_PASSWORD = "Sanket7721"
+DB_HOST = "localhost"
+DB_PORT = "5432"
+DB_NAME = "Predictive_Maintainence"
+
+engine = create_engine(
+    f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+)
+
+@app.get("/")
+def root():
+    return {"message": "Predictive Maintenance API Running"}
+
+
+@app.get("/latest")
+def latest_data():
+
+    df = pd.read_sql(
+        """
+        SELECT *
+        FROM sensor_predictions
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        engine
+    )
+
+    return df.to_dict(orient="records")[0]
+
+
+
+@app.get("/history")
+def history():
+
+    df = pd.read_sql(
+        """
+        SELECT *
+        FROM sensor_predictions
+        ORDER BY id DESC
+        LIMIT 500
+        """,
+        engine
+    )
+
+    return df.to_dict(orient="records")
+
+
+
+
+def get_recommendations(row):
+
+    recommendations = []
+
+    if row["rpm"] < 900:
+        recommendations.append("Inspect motor bearings.")
+
+    if row["outlet_temp"] > 60:
+        recommendations.append("Check cooling system.")
+
+    if row["noise_db"] > 85:
+        recommendations.append("Inspect rotor alignment.")
+
+    if row["water_flow"] < 20:
+        recommendations.append("Inspect water circulation.")
+
+    if not recommendations:
+        recommendations.append("System operating normally.")
+
+    return recommendations
+
+@app.get("/recommendations")
+def recommendations():
+
+    df = pd.read_sql(
+        """
+        SELECT *
+        FROM sensor_predictions
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        engine
+    )
+
+    row = df.iloc[0]
+
+    return {
+        "recommendations": get_recommendations(row)
+    }
+
+@app.get("/health")
+def health():
+
+    df = pd.read_sql(
+        """
+        SELECT anomaly
+        FROM sensor_predictions
+        ORDER BY id DESC
+        LIMIT 500
+        """,
+        engine
+    )
+
+    total = len(df)
+
+    normal = len(
+        df[df["anomaly"] == "Normal"]
+    )
+
+    score = round(
+        (normal / total) * 100,
+        2
+    )
+
+    return {
+        "health_score": score
+    }
+
+Chatbot py
+
+
+
+
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from transformers import pipeline
+import streamlit as st
+
+
+@st.cache_resource
+def load_chatbot():
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+
+    vectorstore = FAISS.load_local(
+        "RAG/faiss_index",
+        embeddings,
+        allow_dangerous_deserialization=True
+    )
+
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+
+    generator = pipeline(
+        "text-generation",
+        model="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    )
+
+    return retriever, generator
+
+
+def ask_question(question):
+    retriever, generator = load_chatbot()
+
+    docs = retriever.invoke(question)
+
+    context = "\n".join([doc.page_content for doc in docs])
+
+    prompt = f"""
+You are a desiccant dehumidifier maintenance assistant.
+Answer ONLY from the provided context.
+
+If answer is unavailable, say:
+I could not find that information in the manual.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
+
+    response = generator(
+        prompt,
+        max_new_tokens=120,
+        do_sample=False
+    )
+
+    generated = response[0]["generated_text"]
+    answer = generated.replace(prompt, "").strip()
+
+    return answer
+
+
+
+
+
+ingest  py
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+
+PDF_PATH = "rag/docs/desiccant_dehumidifier_manual.pdf"
+DB_PATH = "rag/faiss_index"
+
+print("Loading PDF...")
+
+loader = PyPDFLoader(PDF_PATH)
+documents = loader.load()
+
+print(f"Loaded {len(documents)} pages")
+
+print("Splitting document into chunks...")
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200
+)
+
+docs = splitter.split_documents(documents)
+
+print(f"Created {len(docs)} chunks")
+
+print("Creating embeddings...")
+
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+print("Building FAISS vector database...")
+
+vectorstore = FAISS.from_documents(docs, embeddings)
+
+vectorstore.save_local(DB_PATH)
+
+print("PDF ingestion completed successfully.")
+
+
+
+
+anamoly detection py
+
+import pandas as pd
+from sqlalchemy import create_engine
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+
+DB_USER = "postgres"
+DB_PASSWORD = "Sanket7721"
+DB_HOST = "localhost"
+DB_PORT = "5432"
+DB_NAME = "Predictive_Maintainence"
+
+engine = create_engine(
+    f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+)
+
+# Load data
+df = pd.read_sql("SELECT * FROM sensor_data;", engine)
+
+features = [
+    "rpm",
+    "motor_power",
+    "torque",
+    "outlet_pressure_bar",
+    "air_flow",
+    "noise_db",
+    "outlet_temp",
+    "water_flow"
+]
+
+X = df[features]
+
+# Scale
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Model
+model = IsolationForest(
+    contamination=0.05,
+    random_state=42
+)
+
+predictions = model.fit_predict(X_scaled)
+
+scores = model.decision_function(X_scaled)
+
+df["anomaly"] = predictions
+
+df["anomaly"] = df["anomaly"].map({
+    1: "Normal",
+    -1: "Anomaly"
+})
+
+
+from sklearn.preprocessing import MinMaxScaler
+
+risk_scaler = MinMaxScaler(feature_range=(0,100))
+
+df["failure_risk"] = (
+    100 -
+    risk_scaler.fit_transform(
+        scores.reshape(-1,1)
+    )
+).flatten()
+
+
+# Save back to PostgreSQL
+df.to_sql(
+    "sensor_predictions",
+    engine,
+    if_exists="replace",
+    index=False
+)
+
+print(df["anomaly"].value_counts())
+print("Predictions saved to PostgreSQL!")
+
+
+
+
+print(df.columns.tolist())
+
+
+
+
+dashboard py
+
+
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+from streamlit_autorefresh import st_autorefresh
+from RAG.chatbot import ask_question
+import requests
+
+# Auto refresh every 5 sec
+if "chat_busy" not in st.session_state:
+    st.session_state.chat_busy = False
+
+if not st.session_state.chat_busy:
+    st_autorefresh(interval=5000, key="refresh")
+
+st.set_page_config(
+    page_title="AI Predictive Maintenance Dashboard",
+    layout="wide"
+)
+
+
+API_URL = "http://127.0.0.1:8000"
+
+def fetch_history():
+    try:
+        response = requests.get(f"{API_URL}/history", timeout=5)
+        response.raise_for_status()
+        return pd.DataFrame(response.json())
+
+    except requests.exceptions.RequestException as e:
+        st.error(f"Unable to connect to FastAPI:\n{e}")
+        st.stop()
+
+df = fetch_history()
+
+if df.empty:
+    st.warning("No sensor data available.")
+    st.stop()
+
+
+
+st.sidebar.header("Dashboard Controls")
+
+anomaly_filter = st.sidebar.multiselect(
+    "Filter by Status",
+    options=df["anomaly"].unique(),
+    default=df["anomaly"].unique()
+)
+
+df = df[df["anomaly"].isin(anomaly_filter)]
+
+st.markdown("""
+<style>
+
+.metric-container{
+background:#1f2937;
+padding:10px;
+border-radius:10px;
+}
+
+</style>
+""",unsafe_allow_html=True)
+
+st.title("Live AI Predictive Maintenance Dashboard")
+st.markdown("Real-time anomaly monitoring")
+
+total_records = len(df)
+anomaly_count = len(df[df["anomaly"] == "Anomaly"])
+normal_count = len(df[df["anomaly"] == "Normal"])
+
+health_score = round((normal_count / total_records) * 100, 2)
+
+latest = df.iloc[0]
+failure_risk = latest.get("failure_risk", 0)
+
+
+rpm = latest["rpm"]
+temp = latest["outlet_temp"]
+pressure = latest["outlet_pressure_bar"]
+airflow = latest["air_flow"]
+
+col1, col2, col3, col4 = st.columns(4)
+
+col1.metric("Health Score", f"{health_score}%")
+col2.metric("RPM", f"{rpm:.0f}")
+col3.metric("Temperature", f"{temp:.1f} °C")
+col4.metric("Pressure", f"{pressure:.2f} bar")
+
+col5, col6, col7, col8 = st.columns(4)
+
+col5.metric("Records", total_records)
+col6.metric("Normal", normal_count)
+col7.metric("Anomalies", anomaly_count)
+col8.metric("Air Flow", f"{airflow:.1f}")
+
+st.subheader("Failure Assessment")
+
+st.sidebar.success("FastAPI Connected")
+
+st.sidebar.metric(
+    "Health Score",
+    f"{health_score}%"
+)
+
+st.sidebar.metric(
+    "Failure Risk",
+    f"{failure_risk}%"
+)
+
+risk_col1, risk_col2 = st.columns(2)
+
+risk_col1.metric(
+    "Failure Risk",
+    f"{failure_risk:.1f}%"
+)
+
+risk_col2.metric(
+    "Machine Status",
+    "Critical" if failure_risk > 70
+    else "Warning" if failure_risk > 40
+    else "Healthy"
+)
+
+
+def get_recommendations(row):
+
+    recommendations = []
+
+    if row["rpm"] < 900:
+        recommendations.append("Inspect motor bearings.")
+
+    if row["outlet_temp"] > 60:
+        recommendations.append("Check cooling system.")
+
+    if row["noise_db"] > 85:
+        recommendations.append("Inspect rotor alignment.")
+
+    if row["water_flow"] < 20:
+        recommendations.append("Inspect water circulation.")
+
+    if not recommendations:
+        recommendations.append("System operating normally.")
+
+    return recommendations
+
+st.subheader("Maintenance Recommendations")
+
+for rec in get_recommendations(latest):
+    st.info(rec)
+
+
+if anomaly_count > 0:
+    st.error("⚠️ Live anomaly detected!")
+else:
+    st.success("Machine healthy")
+
+col5, col6 = st.columns(2)
+
+with col5:
+    fig1 = px.scatter(
+        df,
+        x="rpm",
+        y="outlet_temp",
+        color="anomaly"
+    )
+    st.plotly_chart(fig1, use_container_width=True)
+
+with col6:
+    fig2 = px.line(
+        df.sort_values("id"),
+        x="id",
+        y="motor_power",
+        color="anomaly"
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
+st.dataframe(df, use_container_width=True)
+
+
+
+
+
+# Chatbot Section 
+
+
+# Chatbot Section
+st.subheader("AI Maintenance Assistant")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
+
+user_query = st.chat_input("Ask about the dehumidifier...")
+
+if user_query:
+    st.session_state.chat_busy = True
+
+    # store user message first
+    st.session_state.messages.append({
+        "role": "user",
+        "content": user_query
+    })
+
+    # show user message
+    with st.chat_message("user"):
+        st.write(user_query)
+
+    # get chatbot response
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            response = ask_question(user_query)
+            st.write(response)
+
+    # store assistant response
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": response
+    })
+
+    st.session_state.chat_busy = False
+
+
+
+
+eda py
+
+
+
+import pandas as pd
+from sqlalchemy import create_engine
+
+DB_USER = "postgres"
+DB_PASSWORD = "Sanket7721"
+DB_HOST = "localhost"
+DB_PORT = "5432"
+DB_NAME = "Predictive_Maintainence"
+
+engine = create_engine(
+    f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+)
+
+df = pd.read_sql("SELECT * FROM sensor_data;", engine)
+
+print(df.head())
+print(df.shape)
+print(df.info())
+print(df.describe())
+print(df.isnull().sum())
